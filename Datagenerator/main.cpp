@@ -1,0 +1,1623 @@
+// #include <windows.h>
+#include <iostream>
+#include <cstdio>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <mutex>          // std::mutex
+#include <casadi/casadi.hpp>
+
+typedef unsigned long long pop_t;
+
+using namespace std;
+std::mutex mtx;           // mutex for critical section
+
+#include "Share_Data.hpp"
+#include "View_Space.hpp"
+// #include <gurobi_c++.h>
+#include "Highs.h"
+
+//Virtual_Perception_3D.hpp
+void precept_thread_process(int i, pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, octomap::point3d* _origin, octomap::point3d* _end, Eigen::Matrix4d* _view_pose_world, octomap::ColorOcTree* _ground_truth_model,Share_Data* share_data);
+
+class Perception_3D {
+public:
+	Share_Data* share_data;
+	octomap::ColorOcTree* ground_truth_model;
+	int full_voxels;
+	pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud;
+
+	Perception_3D(Share_Data* _share_data) {
+		share_data = _share_data;
+		ground_truth_model = share_data->ground_truth_model;
+		full_voxels = share_data->full_voxels;
+	}
+
+	~Perception_3D() {
+
+	}
+
+	bool precept(View* now_best_view) {
+		// cout<<"starting!"<<endl;
+		double now_time = clock();
+		//������ǰ�������
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_parallel(new pcl::PointCloud<pcl::PointXYZRGB>);
+		cloud_parallel->is_dense = false;
+		cloud_parallel->points.resize(full_voxels);
+		//��ȡ�ӵ�λ��
+		Eigen::Matrix4d view_pose_world;
+		now_best_view->get_next_camera_pos(share_data->now_camera_pose_world, share_data->object_center_world);
+		view_pose_world = (share_data->now_camera_pose_world * now_best_view->pose.inverse()).eval();
+		//����ӵ��key
+		octomap::OcTreeKey key_origin;
+		bool key_origin_have = ground_truth_model->coordToKeyChecked(now_best_view->init_pos(0), now_best_view->init_pos(1), now_best_view->init_pos(2), key_origin);
+		if (key_origin_have) {
+			octomap::point3d origin = ground_truth_model->keyToCoord(key_origin);
+			//����ÿ������
+			octomap::point3d* end = new octomap::point3d[full_voxels];
+			octomap::ColorOcTree::leaf_iterator it = ground_truth_model->begin_leafs();
+			for (int i = 0; i < full_voxels; i++) {
+				end[i] = it.getCoordinate();
+				it++;
+			}
+			//ground_truth_model->write(share_data->save_path + "/test_camrea.ot");
+			thread** precept_process = new thread * [full_voxels];
+			for (int i = 0; i < full_voxels; i++) {
+				precept_process[i] = new thread(precept_thread_process, i, cloud_parallel, &origin, &end[i], &view_pose_world, ground_truth_model, share_data);
+			}
+			for (int i = 0; i < full_voxels; i++)
+				(*precept_process[i]).join();
+
+			delete[] end;
+			for (int i = 0; i < full_voxels; i++)
+				precept_process[i]->~thread();
+			delete[] precept_process;
+		}
+		else {
+			cout << "View out of map.check." << endl;
+		}
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr temp(new pcl::PointCloud<pcl::PointXYZRGB>);
+		cloud = temp;
+		cloud->is_dense = false;
+		cloud->points.resize(full_voxels);
+		auto ptr = cloud->points.begin();
+		int vaild_point = 0;
+		auto p = cloud_parallel->points.begin();
+		for (int i = 0; i < cloud_parallel->points.size(); i++, p++)
+		{
+			if ((*p).x == 0 && (*p).y == 0 && (*p).z == 0) continue;
+			(*ptr).x = (*p).x;
+			(*ptr).y = (*p).y;
+			(*ptr).z = (*p).z;
+			(*ptr).b = (*p).b;
+			(*ptr).g = (*p).g;
+			(*ptr).r = (*p).r;
+			vaild_point++;
+			ptr++;
+		}
+		cloud->width = vaild_point;
+		cloud->height = 1;
+		cloud->points.resize(vaild_point);
+		//��¼��ǰ�ɼ�����
+		share_data->vaild_clouds++;
+		share_data->clouds.push_back(cloud);
+		//��ת����������ϵ
+		//*share_data->cloud_final += *cloud;
+		cout << "virtual cloud get with executed time " << double(clock() - now_time) / CLOCKS_PER_SEC << " s." << endl;
+		if (share_data->show) { //��ʾ�������
+			pcl::visualization::PCLVisualizer::Ptr viewer1(new pcl::visualization::PCLVisualizer("Camera"));
+			viewer1->setBackgroundColor(255, 255, 255);
+			viewer1->addCoordinateSystem(0.1);
+			viewer1->initCameraParameters();
+			viewer1->addPointCloud<pcl::PointXYZRGB>(cloud, "cloud");
+			Eigen::Vector4d X(0.05, 0, 0, 1);
+			Eigen::Vector4d Y(0, 0.05, 0, 1);
+			Eigen::Vector4d Z(0, 0, 0.05, 1);
+			Eigen::Vector4d O(0, 0, 0, 1);
+			X = view_pose_world * X;
+			Y = view_pose_world * Y;
+			Z = view_pose_world * Z;
+			O = view_pose_world * O;
+			viewer1->addLine<pcl::PointXYZ>(pcl::PointXYZ(O(0), O(1), O(2)), pcl::PointXYZ(X(0), X(1), X(2)), 255, 0, 0, "X" + to_string(-1));
+			viewer1->addLine<pcl::PointXYZ>(pcl::PointXYZ(O(0), O(1), O(2)), pcl::PointXYZ(Y(0), Y(1), Y(2)), 0, 255, 0, "Y" + to_string(-1));
+			viewer1->addLine<pcl::PointXYZ>(pcl::PointXYZ(O(0), O(1), O(2)), pcl::PointXYZ(Z(0), Z(1), Z(2)), 0, 0, 255, "Z" + to_string(-1));
+			while (!viewer1->wasStopped())
+			{
+				viewer1->spinOnce(100);
+				boost::this_thread::sleep(boost::posix_time::microseconds(100000));
+			}
+		}
+		// cout<<"1!"<<endl;
+
+		// cout <<cloud_parallel->size()<<endl;
+		if(cloud_parallel)cloud_parallel.reset();
+		// if(!cloud_parallel)cout<<"Im ziyi Li"<<endl;
+		// cloud_parallel->~PointCloud();
+		// cout<<"2!"<<endl;
+
+		return true;
+	}
+};
+
+inline octomap::point3d project_pixel_to_ray_end(int x, int y, rs2_intrinsics& color_intrinsics, Eigen::Matrix4d& now_camera_pose_world, float max_range) {
+	float pixel[2] = { x ,y };
+	float point[3];
+	rs2_deproject_pixel_to_point(point, &color_intrinsics, pixel, max_range);
+	Eigen::Vector4d point_world(point[0], point[1], point[2], 1);
+	point_world = now_camera_pose_world * point_world;
+	return octomap::point3d(point_world(0), point_world(1), point_world(2));
+}
+
+void precept_thread_process(int i, pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, octomap::point3d* _origin, octomap::point3d* _end, Eigen::Matrix4d* _view_pose_world,octomap::ColorOcTree* _ground_truth_model, Share_Data* share_data) {
+	//num++;
+	// cout << "thread #" << i << '\n';
+	octomap::point3d origin = *_origin;
+	Eigen::Matrix4d view_pose_world = *_view_pose_world;
+	octomap::ColorOcTree* ground_truth_model = _ground_truth_model;
+	pcl::PointXYZRGB point;
+	point.x = 0; point.y = 0; point.z = 0;
+	//ͶӰ����Ƿ��ڳ���Χ��
+	Eigen::Vector4d end_3d(_end->x(), _end->y(), _end->z(),1);
+	Eigen::Vector4d vertex = view_pose_world.inverse() * end_3d;
+	float point_3d[3] = { vertex(0), vertex(1),vertex(2) };
+	float pixel[2];
+	rs2_project_point_to_pixel(pixel, &share_data->color_intrinsics, point_3d);
+	if (pixel[0] < 0 || pixel[0]>share_data->color_intrinsics.width || pixel[1] < 0 || pixel[1]>share_data->color_intrinsics.height) {
+		cloud->points[i] = point;
+		return;
+	}
+	//����ͶӰ�ҵ��յ�
+	octomap::point3d end = project_pixel_to_ray_end(pixel[0], pixel[1], share_data->color_intrinsics, view_pose_world, 1.0);
+
+	octomap::OcTreeKey key_end;
+	octomap::point3d direction = end - origin;
+	octomap::point3d end_point;
+	//Խ��δ֪�����ҵ��յ�
+	bool found_end_point = ground_truth_model->castRay(origin, direction, end_point, true, 1.0);
+	if (!found_end_point) {//δ�ҵ��յ㣬�޹۲�����
+		cloud->points[i] = point;
+		return;
+	}
+	if (end_point == origin) {
+		cout << "view in the object. check!"<<endl;
+		cloud->points[i] = point;
+		return;
+	}
+	//���һ��ĩ���Ƿ��ڵ�ͼ���Ʒ�Χ��
+	bool key_end_have = ground_truth_model->coordToKeyChecked(end_point, key_end);
+	if (key_end_have) {
+		octomap::ColorOcTreeNode* node = ground_truth_model->search(key_end);
+		if (node != NULL) {
+			octomap::ColorOcTreeNode::Color color = node->getColor();
+			point.x = end_point.x();
+			point.y = end_point.y();
+			point.z = end_point.z();
+			point.b = color.b;
+			point.g = color.g;
+			point.r = color.r;
+		}
+	}
+	cloud->points[i] = point;
+}
+
+//views_voxels_LM.hpp
+// class views_voxels_LM {
+// public:
+// 	Share_Data* share_data;
+// 	View_Space* view_space;
+// 	vector<vector<bool>> graph;
+// 	unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* voxel_id_map;	//set an only ID for every single voxel
+// 	int num_of_voxel;
+// 	set<int>* chosen_views;
+// 	GRBEnv* env;
+// 	GRBModel* model;
+// 	vector<GRBVar> x;
+// 	GRBLinExpr obj;
+
+// 	void solve() {
+// 		// Optimize model
+// 		model->optimize();
+// 		// show nonzero variables
+// 		/*for (int i = 0; i < share_data->num_of_views; i++)
+// 			if (x[i].get(GRB_DoubleAttr_X) == 1.0)
+// 				cout << x[i].get(GRB_StringAttr_VarName) << " " << x[i].get(GRB_DoubleAttr_X) << endl;
+// 		// show num of views
+// 		cout << "Obj: " << model->get(GRB_DoubleAttr_ObjVal) << endl;*/
+// 	}
+
+// 	vector<int> get_view_id_set() {
+// 		vector<int> ans;
+// 		for (int i = 0; i < share_data->num_of_views; i++)
+// 			if (x[i].get(GRB_DoubleAttr_X) == 1.0) ans.push_back(i);
+// 		return ans;
+// 	}
+
+// 	views_voxels_LM(Share_Data* _share_data, View_Space* _view_space, set<int>* _chosen_views) {
+// 		double now_time = clock();
+// 		share_data = _share_data;
+// 		view_space = _view_space;
+// 		chosen_views = _chosen_views;
+// 		//�������ص�id��
+// 		num_of_voxel = 0;
+// 		voxel_id_map = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+// 		for (int i = 0; i < share_data->voxels.size(); i++) {
+// 			for (auto& it : *share_data->voxels[i]) {
+// 				if (voxel_id_map->find(it.first) == voxel_id_map->end()) {
+// 					(*voxel_id_map)[it.first] = num_of_voxel++;
+// 				}
+// 			}
+// 		}
+// 		//cout << num_of_voxel << " real | gt " << share_data->full_voxels << endl;
+// 		graph.resize(num_of_voxel);
+// 		for (int i = 0; i < share_data->num_of_views; i++) {
+// 			graph[i].resize(num_of_voxel);
+// 			for (int j = 0; j < num_of_voxel; j++) {
+// 				graph[i][j] = 0;
+// 			}
+// 		}
+// 		set<int> voxels_not_need;
+// 		for (int i = 0; i < share_data->voxels.size(); i++) {
+// 			for (auto& it : *share_data->voxels[i]) {
+// 				graph[i][(*voxel_id_map)[it.first]] = 1;
+// 				if (chosen_views->find(i) != chosen_views->end()) {
+// 					voxels_not_need.insert((*voxel_id_map)[it.first]);
+// 				}
+// 			}
+// 		}
+// 		//������Ӧ�����Թ滮�����
+// 		now_time = clock();
+// 		env = new GRBEnv();
+// 		model = new GRBModel(*env);
+// 		x.resize(share_data->num_of_views);
+// 		// Create variables
+// 		for (int i = 0; i < share_data->num_of_views; i++)
+// 			x[i] = model->addVar(0.0, 1.0, 0.0, GRB_BINARY, "x" + to_string(i));
+// 		// Set objective : \sum_{s\in S} x_s
+// 		for (int i = 0; i < share_data->num_of_views; i++)
+// 			obj += x[i];
+// 		model->setObjective(obj, GRB_MINIMIZE);
+// 		// Add linear constraint: \sum_{S:e\in S} x_s\geq1
+// 		for (int j = 0; j < num_of_voxel; j++)
+// 		{
+// 			if (voxels_not_need.find(j) != voxels_not_need.end()) continue;
+// 			GRBLinExpr subject_of_voxel;
+// 			for (int i = 0; i < share_data->num_of_views; i++)
+// 				if (graph[i][j] == 1) subject_of_voxel += x[i];
+// 			model->addConstr(subject_of_voxel >= 1, "c" + to_string(j));
+// 		}
+// 		model->set("TimeLimit", "10");
+// 		//cout << "Integer linear program formulated with executed time " << clock() - now_time << " ms." << endl;
+// 	}
+
+// 	~views_voxels_LM() {
+// 		delete voxel_id_map;
+// 		delete env;
+// 		delete model;
+// 	}
+// };
+
+
+// 如果有自定义的 Share_Data / View_Space / octomap::OcTreeKey 头文件，要记得包含
+
+class views_voxels_LM {
+	public:
+		Share_Data* share_data;
+		View_Space* view_space;
+		// 与 Gurobi 版本保持同名同类型
+		vector<vector<bool>> graph;
+		unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* voxel_id_map;
+		int num_of_voxel;
+		set<int>* chosen_views;
+	
+		// Gurobi里是 GRBEnv* env; GRBModel* model; vector<GRBVar> x;
+		// HiGHS里对应为:
+		Highs highs;         // 类似 "env + model" 的整体
+		HighsLp lp;          // 存放LP / MIP的核心数据
+		vector<double> x;    // 用来记录变量最终解 (和 Gurobi 中的 x[] 对应)
+		double obj_value;    // 类似 model->get(GRB_DoubleAttr_ObjVal)
+	
+		// 与 Gurobi的solve()对应
+		void solve() {
+			// 模拟 "model->optimize();"
+			// 先将lp传递给 highs
+			HighsStatus st_pass = highs.passModel(lp);
+			if (st_pass != HighsStatus::kOk) {
+				cerr << "[HiGHS Error] passModel() failed. Status=" << (int)st_pass << endl;
+				return;
+			}
+			// 求解
+			HighsStatus st_run = highs.run();
+			if (st_run != HighsStatus::kOk && st_run != HighsStatus::kWarning) {
+				cerr << "[HiGHS Error] run() failed or infeasible. Status=" << (int)st_run << endl;
+				return;
+			}
+			// 拿到解
+			const HighsSolution& sol = highs.getSolution();
+			x = sol.col_value; // Gurobi里: x[i].get(GRB_DoubleAttr_X)
+			obj_value = highs.getInfo().objective_function_value; // Gurobi: model->get(GRB_DoubleAttr_ObjVal)
+		}
+	
+		// 与 Gurobi版 get_view_id_set() 对应
+		vector<int> get_view_id_set() {
+			vector<int> ans;
+			// Gurobi里是 "for i in num_of_views, if x[i]==1 => ans.push_back(i)"
+			// HiGHS若正常得到0/1解, 可以直接用 >0.5 判定
+			for (int i = 0; i < share_data->num_of_views; i++) {
+				if (i < (int)x.size() && x[i] > 0.5)
+					ans.push_back(i);
+			}
+			return ans;
+		}
+	
+		// 构造函数: 与 Gurobi 版在结构、注释、顺序上尽量对应
+		views_voxels_LM(Share_Data* _share_data, View_Space* _view_space, set<int>* _chosen_views) {
+			double now_time = clock();
+			share_data = _share_data;
+			view_space = _view_space;
+			chosen_views = _chosen_views;
+	
+			// Gurobi版本: "num_of_voxel = 0; voxel_id_map = new ..."
+			num_of_voxel = 0;
+			voxel_id_map = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+	
+			// 构建体素id映射
+			for (int i = 0; i < (int)share_data->voxels.size(); i++) {
+				for (auto& it : *share_data->voxels[i]) {
+					if (voxel_id_map->find(it.first) == voxel_id_map->end()) {
+						(*voxel_id_map)[it.first] = num_of_voxel++;
+					}
+				}
+			}
+	
+			// (与Gurobi版同) graph.resize(num_of_voxel);
+			// 接下来在 for (i < num_of_views) 里对 graph[i].resize(num_of_voxel)
+			// 这个写法有越界风险, 但我们保持和 Gurobi 原版一样.
+			graph.resize(num_of_voxel);
+			for (int i = 0; i < share_data->num_of_views; i++) {
+				// 如果 i >= num_of_voxel 就会越界, 需确保 num_of_voxel >= num_of_views
+				graph[i].resize(num_of_voxel);
+				for (int j = 0; j < num_of_voxel; j++) {
+					graph[i][j] = false;
+				}
+			}
+	
+			// 构建一个集合 voxels_not_need (Gurobi里: "if chosen_views->find(i) != end")
+			set<int> voxels_not_need;
+			for (int i = 0; i < (int)share_data->voxels.size(); i++) {
+				for (auto& it : *share_data->voxels[i]) {
+					int vid = (*voxel_id_map)[it.first];
+					graph[i][vid] = true;  // "graph[i][(*voxel_id_map)[it.first]] = 1;"
+					if (chosen_views->find(i) != chosen_views->end()) {
+						voxels_not_need.insert(vid);
+					}
+				}
+			}
+	
+			// -------------------------
+			// 以下对应 Gurobi: env = new GRBEnv(); model = new GRBModel(*env);
+			// 在 HiGHS 中不用 new, 直接 Highs highs;
+			// -------------------------
+			// 变量 x 先用普通 vector<double> 承载解; 在 LP 里声明
+	
+			// -------------------------
+			// 构造 LP:  Minimize sum(x[i])  约束: ∑_{i ∈ covers(j)} x[i] >= 1
+			// 与 Gurobi 版的 addVar / addConstr / setObjective 相对应
+			// -------------------------
+			int num_views = share_data->num_of_views;
+			lp.num_col_ = num_views;
+			lp.num_row_ = 0; // 先留 0 行, 后续添加
+			lp.col_cost_.assign(num_views, 1.0);   // 目标: sum(x[i])
+			lp.col_lower_.assign(num_views, 0.0);    // x[i] >= 0
+			lp.col_upper_.assign(num_views, 1.0);    // x[i] <= 1
+	
+			// 在 v1.9.0 中没有 kBinary，因此采用 kInteger 表示二进制变量 (配合 [0,1] 边界)
+			lp.integrality_.assign(num_views, HighsVarType::kInteger);
+	
+			// 收集覆盖约束：对于每个未被 chosen_views 覆盖的体素 j，要求 ∑_{i|graph[i][j]==true} x[i] >= 1
+			vector<int> constraint_voxel;  // 每个约束行对应的体素编号
+			for (int j = 0; j < num_of_voxel; j++) {
+				if (voxels_not_need.find(j) == voxels_not_need.end()) {
+					constraint_voxel.push_back(j);
+					lp.row_lower_.push_back(1.0);  // 下界为 1
+					lp.row_upper_.push_back(numeric_limits<double>::infinity()); // 上界无限制
+				}
+			}
+			lp.num_row_ = (int)constraint_voxel.size();
+	
+			// 构造稀疏矩阵: A matrix (按列存储)
+			cout <<"the number of the num_views"<< num_views<< endl;
+			vector<int> Astart(num_views + 1, 0);
+			vector<int> Aindex;
+			vector<double> Avalue;
+			for (int i = 0; i < num_views; i++) {
+				Astart[i] = (int)Aindex.size();
+				for (int r = 0; r < (int)constraint_voxel.size(); r++) {
+					int voxel_j = constraint_voxel[r];
+					if (graph[i][voxel_j]) {
+						Aindex.push_back(r);
+						Avalue.push_back(1.0);
+					}
+				}
+			}
+			Astart[num_views] = (int)Aindex.size();
+			lp.a_matrix_.start_ = Astart;
+			lp.a_matrix_.index_ = Aindex;
+			lp.a_matrix_.value_ = Avalue;
+			
+	
+			// 注意：v1.9.0 中使用旧式的矩阵格式字段 a_format_ 而非 a_matrix_.format_
+			// lp.a_matrix_.format_ = MatrixFormat::kColwise;  // kColwise 通常等于 1，表示列式存储
+	
+			lp.col_cost_ = lp.col_cost_; // 已设置目标函数系数
+			lp.sense_ = ObjSense::kMinimize;
+			lp.offset_ = 0.0;
+	
+			// 设置时间限制: 10 秒
+			highs.setOptionValue("time_limit", 10.0);
+		}
+	
+		// 析构函数 (与 Gurobi 版本对应的 delete voxel_id_map, etc.)
+		~views_voxels_LM() {
+			delete voxel_id_map;
+			// HiGHS 不需要 delete
+		}
+	};
+
+//NBV_Net_Labeler.hpp
+class NBV_Net_Labeler
+{
+public:
+	Share_Data* share_data;
+	View_Space* view_space;
+	Perception_3D* percept;
+	pcl::visualization::PCLVisualizer::Ptr viewer;
+	int toward_state;
+	int rotate_state;
+
+	double check_size(double predicted_size, Eigen::Vector3d object_center_world, vector<Eigen::Vector3d>& points) {
+		int vaild_points = 0;
+		for (auto& ptr : points) {
+			if (ptr(0) < object_center_world(0) - predicted_size || ptr(0) > object_center_world(0) + predicted_size) continue;
+			if (ptr(1) < object_center_world(1) - predicted_size || ptr(1) > object_center_world(1) + predicted_size) continue;
+			if (ptr(2) < object_center_world(2) - predicted_size || ptr(2) > object_center_world(2) + predicted_size) continue;
+			vaild_points++;
+		}
+		return (double)vaild_points / (double)points.size();
+	}
+
+	NBV_Net_Labeler(Share_Data* _share_data, int _toward_state = 0, int _rotate_state = 0) {
+		share_data = _share_data;
+		toward_state = _toward_state;
+		rotate_state = _rotate_state;
+		share_data->save_path += share_data->name_of_pcd + "/rotate_" + to_string(rotate_state);
+		share_data->save_path_nbvnet += share_data->name_of_pcd + "/rotate_" + to_string(rotate_state);
+		share_data->save_path_pcnbv += share_data->name_of_pcd + "/rotate_" + to_string(rotate_state);
+		cout << "toward_state is " << toward_state << " , rotate_state is " << rotate_state << endl;
+		//��ʼ��GT
+		//��ת6������֮һ
+		pcl::transformPointCloud(*share_data->cloud_pcd, *share_data->cloud_pcd, share_data->get_toward_pose(toward_state));
+		//��ת8���Ƕ�֮һ
+		Eigen::Matrix3d rotation;
+		rotation = Eigen::AngleAxisd(0, Eigen::Vector3d::UnitX()) *
+			Eigen::AngleAxisd(0, Eigen::Vector3d::UnitY()) *
+			Eigen::AngleAxisd(45 * rotate_state * acos(-1.0) / 180.0, Eigen::Vector3d::UnitZ());
+		Eigen::Matrix4d T_pose(Eigen::Matrix4d::Identity(4, 4));
+		T_pose(0, 0) = rotation(0, 0); T_pose(0, 1) = rotation(0, 1); T_pose(0, 2) = rotation(0, 2); T_pose(0, 3) = 0;
+		T_pose(1, 0) = rotation(1, 0); T_pose(1, 1) = rotation(1, 1); T_pose(1, 2) = rotation(1, 2); T_pose(1, 3) = 0;
+		T_pose(2, 0) = rotation(2, 0); T_pose(2, 1) = rotation(2, 1); T_pose(2, 2) = rotation(2, 2); T_pose(2, 3) = 0;
+		T_pose(3, 0) = 0;			   T_pose(3, 1) = 0;			  T_pose(3, 2) = 0;			     T_pose(3, 3) = 1;
+		pcl::transformPointCloud(*share_data->cloud_pcd, *share_data->cloud_pcd, T_pose);
+		//share_data->access_directory(share_data->save_path);
+		//pcl::io::savePCDFile<pcl::PointXYZ>(share_data->save_path+to_string(toward_state)+"_"+ to_string(rotate_state) +".pcd", *cloud_pcd);
+		//GT cloud
+		share_data->cloud_ground_truth->is_dense = false;
+		share_data->cloud_ground_truth->points.resize(share_data->cloud_pcd->points.size());
+		share_data->cloud_ground_truth->width = share_data->cloud_pcd->points.size();
+		share_data->cloud_ground_truth->height = 1;
+		auto ptr = share_data->cloud_ground_truth->points.begin();
+		auto p = share_data->cloud_pcd->points.begin();
+		float unit = 1.0;
+		for (auto& ptr : share_data->cloud_pcd->points) {
+			if (fabs(ptr.x) >= 10 || fabs(ptr.y) >= 10 || fabs(ptr.z) >= 10) {
+				unit = 0.001;
+				cout << "change unit from <mm> to <m>." << endl;
+				break;
+			}
+		}
+		//��������С��ͳһ����Ϊ0.10m����
+		vector<Eigen::Vector3d> points;
+		for (auto& ptr : share_data->cloud_pcd->points) {
+			Eigen::Vector3d pt(ptr.x * unit, ptr.y * unit, ptr.z * unit);
+			points.push_back(pt);
+		}
+		Eigen::Vector3d object_center_world = Eigen::Vector3d(0, 0, 0);
+		//�����������
+		for (auto& ptr : points) {
+			object_center_world(0) += ptr(0);
+			object_center_world(1) += ptr(1);
+			object_center_world(2) += ptr(2);
+		}
+		object_center_world(0) /= points.size();
+		object_center_world(1) /= points.size();
+		object_center_world(2) /= points.size();
+		//���ֲ���BBX�뾶����BBX�ڵ�ĸ������ʴﵽ0.90-0.95Ϊ��ֹ����
+		/*double l = 0, r = 0, mid;
+		for (auto& ptr : points) {
+			r = max(r, (object_center_world - ptr).norm());
+		}
+		mid = (l + r) / 2;
+		double precent = check_size(mid, object_center_world, points);
+		double pre_precent = precent;
+		while (precent > 0.999 || precent < 1.0) {
+			if (precent > 0.999) {
+				r = mid;
+			}
+			else if (precent < 1.0) {
+				l = mid;
+			}
+			mid = (l + r) / 2;
+			precent = check_size(mid, object_center_world, points);
+			if (fabs(pre_precent - precent) < 0.001) break;
+			pre_precent = precent;
+		}*/
+		//������Զ��
+		double predicted_size = 0.0;
+		for (auto& ptr : points) {
+			predicted_size = max(predicted_size, (object_center_world - ptr).norm());
+		}
+		predicted_size *= 17.0/16.0;
+		//predicted_size = 0.16;
+
+		double scale = 1.0;
+		if (share_data->mp_scale.find(share_data->name_of_pcd)!= share_data->mp_scale.end()) {
+			scale = (predicted_size - share_data->mp_scale[share_data->name_of_pcd]) / predicted_size;
+			cout << "object " << share_data->name_of_pcd << " large. change scale " << predicted_size << " to about " << predicted_size - share_data->mp_scale[share_data->name_of_pcd] << " m." << endl;
+		}
+		else {
+			cout << "object " << share_data->name_of_pcd << " size is " << predicted_size << " m." << endl;
+		}
+
+		//��̬�ֱ���
+		double predicted_octomap_resolution = scale * predicted_size * 2.0 / 32.0;
+		cout << "choose octomap_resolution: " << predicted_octomap_resolution << " m." << endl;
+		share_data->octomap_resolution = predicted_octomap_resolution;
+		share_data->octo_model = new octomap::ColorOcTree(share_data->octomap_resolution);
+		share_data->GT_sample = new octomap::ColorOcTree(share_data->octomap_resolution);
+		//����BBX�ߴ�
+		for (int i = 0; i < 32; i++)
+			for (int j = 0; j < 32; j++)
+				for (int k = 0; k < 32; k++)
+				{
+					double x = object_center_world(0) * scale * unit - scale * predicted_size + share_data->octomap_resolution * i;
+					double y = object_center_world(1) * scale * unit - scale * predicted_size + share_data->octomap_resolution * j;
+					double z = object_center_world(2) * scale * unit - scale * predicted_size + share_data->octomap_resolution * k;
+					share_data->GT_sample->setNodeValue(x, y, z, share_data->GT_sample->getProbMissLog(), true); //��ʼ������0
+					//cout << x << " " << y << " " << z << endl;
+				}
+
+		//ת������
+		//double min_z = 0;
+		double min_z = object_center_world(2) * scale * unit;
+		for (int i = 0; i < share_data->cloud_pcd->points.size(); i++, p++)
+		{
+			(*ptr).x = (*p).x * scale * unit;
+			(*ptr).y = (*p).y * scale * unit;
+			(*ptr).z = (*p).z * scale * unit;
+			(*ptr).b = 0;
+			(*ptr).g = 0;
+			(*ptr).r = 255;
+			//GT�������
+			octomap::OcTreeKey key;  
+			bool key_have = share_data->ground_truth_model->coordToKeyChecked(octomap::point3d((*ptr).x, (*ptr).y, (*ptr).z), key);
+			if (key_have) {
+				octomap::ColorOcTreeNode* voxel = share_data->ground_truth_model->search(key);
+				if (voxel == NULL) {
+					share_data->ground_truth_model->setNodeValue(key, share_data->ground_truth_model->getProbHitLog(), true);
+					share_data->ground_truth_model->integrateNodeColor(key, (*ptr).r, (*ptr).g, (*ptr).b);
+				}
+			}
+			min_z = min(min_z, (double)(*ptr).z);
+			//GT_sample�������
+			octomap::OcTreeKey key_sp;  
+			bool key_have_sp = share_data->GT_sample->coordToKeyChecked(octomap::point3d((*ptr).x, (*ptr).y, (*ptr).z), key_sp);
+			if (key_have_sp) {
+				octomap::ColorOcTreeNode* voxel_sp = share_data->GT_sample->search(key_sp);
+				//if (voxel_sp == NULL) {
+					share_data->GT_sample->setNodeValue(key_sp, share_data->GT_sample->getProbHitLog(), true);
+					share_data->GT_sample->integrateNodeColor(key_sp, 255, 0, 0);
+				//}
+			}
+			ptr++;
+		}
+		//��¼����
+		share_data->min_z_table = min_z - share_data->ground_truth_resolution;
+
+		//share_data->access_directory(share_data->save_path);
+		share_data->ground_truth_model->updateInnerOccupancy();
+		//share_data->ground_truth_model->write(share_data->save_path + "/GT.ot");
+		//GT_sample_voxels
+		share_data->GT_sample->updateInnerOccupancy();
+		//share_data->GT_sample->write(share_data->save_path + "/GT_sample.ot");
+		share_data->init_voxels = 0;
+		for (octomap::ColorOcTree::leaf_iterator it = share_data->GT_sample->begin_leafs(), end = share_data->GT_sample->end_leafs(); it != end; ++it) {
+			share_data->init_voxels++;
+		}
+		//cout << "Map_GT_sample has voxels " << share_data->init_voxels << endl;
+		//if (share_data->init_voxels != 32768) cout << "WARNING! BBX small." << endl;
+		//ofstream fout(share_data->save_path + "/GT_size.txt");
+		//fout << scale * predicted_size << endl;
+
+		share_data->full_voxels = 0;
+		for (octomap::ColorOcTree::leaf_iterator it = share_data->ground_truth_model->begin_leafs(), end = share_data->ground_truth_model->end_leafs(); it != end; ++it) {
+			share_data->full_voxels++;
+		}
+
+		//��ʼ��viewspace
+		view_space = new View_Space(share_data);
+
+		//������ʼ��
+		percept = new Perception_3D(share_data);
+
+		//srand(time(0));
+	}
+
+	int get_nbv_view_cases_and_distrubution() {
+		double now_time = clock();
+		//ÿ���ӵ����ͳ������
+		int full_num = 0;
+		unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* all_voxel = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+		for (int i = 0; i < view_space->views.size(); i++) {
+			percept->precept(&view_space->views[i]);
+			//get voxel map
+			int num = 0;
+			unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* voxel = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+			for (int j = 0; j < share_data->clouds[i]->points.size(); j++) {
+				octomap::OcTreeKey key = share_data->ground_truth_model->coordToKey(share_data->clouds[i]->points[j].x, share_data->clouds[i]->points[j].y, share_data->clouds[i]->points[j].z);
+				if (voxel->find(key) == voxel->end()) {
+					(*voxel)[key] = num++;
+				}
+				if (all_voxel->find(key) == all_voxel->end()) {
+					(*all_voxel)[key] = full_num++;
+				}
+			}
+			share_data->voxels.push_back(voxel);
+		}
+		delete all_voxel;
+		cout << "All voxels(cloud) num is " << full_num << endl;
+		cout << "all virtual cloud get with executed time " << clock() - now_time << " ms." << endl;
+
+		now_time = clock();
+		vector<vector<double>> distrubution; //i个视点个数时所能增加的比例
+		distrubution.resize(share_data->num_of_views);
+		//ö��ÿ���ӽ�����
+		vector<long long> nbv_view_cases;
+		for (int k = 0; k < share_data->num_of_views; k++) {
+			long long now_view_case = 1LL << k;
+			while (true) {
+				//���㵱ǰview_case�ɼ�����
+				set<int> chosen_views;
+				for (long long j = now_view_case, i = 0; j != 0; j >>= 1, i++)
+					if (j & 1) { //jλ��i�ӵ�
+						chosen_views.insert(i);
+					}
+				int now_num_visible = 0;
+				unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* observed_voxel = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+				for (long long j = now_view_case, i = 0; j != 0; j >>= 1, i++)
+					if (j & 1) { //jλ��k�ӵ�
+						for (auto& key : *share_data->voxels[i]) {
+							if (observed_voxel->find(key.first) == observed_voxel->end()) {
+								(*observed_voxel)[key.first] = now_num_visible++;
+							}
+						}
+					}
+				//cout <<"All visible voxels(cloud) num is "<< now_num_visible << endl;
+				//ͳ�Ʒֲ�
+				distrubution[chosen_views.size() - 1].push_back(1.0 * now_num_visible / full_num);
+				//�����ȫ���ǣ������ֲ������
+				if (now_num_visible == full_num) {
+					for (int k = chosen_views.size() - 1; k >= 1; k--) { //�ֲ���ÿ�����һ���ǵ�ǰ����������ż�ǰһ��
+						distrubution[k][distrubution[k].size() - 1] -= distrubution[k - 1][distrubution[k - 1].size() - 1];
+					}
+					//for (int k = 0; k < chosen_views.size(); k++) cout << distrubution[k][distrubution[k].size() - 1] << endl;
+					//cout << endl;
+					break;
+				}
+				// û��������һ��view_case
+				nbv_view_cases.push_back(now_view_case);
+				//ͨ����ּ�����һ��view_case
+				vector<int> score;
+				score.resize(share_data->num_of_views);
+				for (int i = 0; i < share_data->num_of_views; i++)
+					score[i] = 0;
+				for (int i = 0; i < view_space->views.size(); i++)
+					if (chosen_views.count(i) == 0) { //jλ��i�ӵ�
+						for (auto& key : *share_data->voxels[i]) {
+							if (observed_voxel->find(key.first) == observed_voxel->end()) {
+								score[i]++;
+							}
+						}
+						//cout << i <<" : " << score[i] << endl;
+					}
+				int best_view_id = -1;
+				int best_score = -1;
+				for (int i = 0; i < view_space->views.size(); i++)
+					if (chosen_views.count(i) == 0) { //jλ��i�ӵ�
+						if (score[i] > best_score) {
+							best_score = score[i];
+							best_view_id = i;
+						}
+					}
+				delete observed_voxel;
+				//����view_case
+				now_view_case |= (1LL << best_view_id);
+			}
+		}
+		cout << "gt getted with executed time " << clock() - now_time << " ms." << endl;
+		//����ֲ���view_case
+		share_data->access_directory(share_data->gt_path + share_data->name_of_pcd + "/rotate_" + to_string(rotate_state));
+		for (int i = 0; i < share_data->num_of_views; i++) {
+			if (distrubution[i].size() == 0) break;
+			ofstream fout_distrubution(share_data->gt_path + share_data->name_of_pcd + "/rotate_" + to_string(rotate_state) + "/nbv_" + to_string(i) + ".txt");
+			fout_distrubution << setprecision(10);
+			for (int j = 0; j < distrubution[i].size(); j++) {
+				fout_distrubution << distrubution[i][j] << "\n";
+			}
+		}
+		ofstream fout_view_cases(share_data->gt_path + share_data->name_of_pcd + "/rotate_" + to_string(rotate_state) + "/view_cases.txt");
+		for (int i = 0; i < nbv_view_cases.size(); i++) {
+			fout_view_cases << nbv_view_cases[i] << "\n";
+		}
+
+		return 0;
+	}
+
+	int label_all_view_csaes() {
+		double now_time = clock();// 初始化计时器，用于测量程序运行时间
+		int full_num = 0;// 用于统计全局的体素数量
+		unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* all_voxel = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+		// 动态分配一个哈希表，用于存储所有体素及其编号的映射关系
+		for (int i = 0; i < view_space->views.size(); i++) {// 遍历所有视点
+			// cout<<i<<endl;
+			percept->precept(&view_space->views[i]);// 对当前视点进行感知处理
+			int num = 0;// 初始化当前视点的体素映射
+			unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* voxel = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+			for (int j = 0; j < share_data->clouds[i]->points.size(); j++) {
+				octomap::OcTreeKey key = share_data->ground_truth_model->coordToKey(share_data->clouds[i]->points[j].x, share_data->clouds[i]->points[j].y, share_data->clouds[i]->points[j].z);
+				if (voxel->find(key) == voxel->end()) {
+					(*voxel)[key] = num++;
+				}
+				if (all_voxel->find(key) == all_voxel->end()) {
+					(*all_voxel)[key] = full_num++;
+				}
+			}
+			share_data->voxels.push_back(voxel);
+			// cout<<"out2"<<endl;
+		}
+		delete all_voxel;
+		cout << "All voxels(cloud) num is " << full_num << endl;
+		cout << "all virtual cloud get with executed time " << clock() - now_time << " ms." << endl;
+
+		now_time = clock();
+		cout << "debug ziyi" << share_data->view_cases.size() <<endl;
+		for (long long cas = 0; cas < share_data->view_cases.size(); cas++) { //����cas
+			// cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!debug ziyi" << (share_data->view_cases[cas] != 134217872) << endl;
+			// if (share_data->view_cases[cas] != 134217872) continue; //for testing
+			//cout << cas << " case testing:" << endl;
+			set<int> chosen_views;
+			for (long long j = share_data->view_cases[cas], i = 0; j != 0; j >>= 1, i++)
+				if (j & 1) { //jλ��i�ӵ�
+					chosen_views.insert(i);
+				}
+			int num = 0;
+			unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>* observed_voxel = new unordered_map<octomap::OcTreeKey, int, octomap::OcTreeKey::KeyHash>();
+			for (long long j = share_data->view_cases[cas], i = 0; j != 0; j >>= 1, i++)
+				if(j&1){ //jλ��i�ӵ�
+					for (auto &key: *share_data->voxels[i]) {
+						if (observed_voxel->find(key.first) == observed_voxel->end()) {
+							(*observed_voxel)[key.first] = num++;
+						}
+					}
+				}
+			//cout <<"All visible voxels(cloud) num is "<< num << endl;
+			// cout << "out1 " << endl;
+
+
+			//NBV���
+			vector<int> score;
+			score.resize(share_data->num_of_views);
+			for (int i = 0; i < share_data->num_of_views; i++)
+				score[i] = 0;
+			//octomap::ColorOcTree* u_rest = new octomap::ColorOcTree(share_data->ground_truth_resolution);
+			for(int i=0;i<view_space->views.size();i++)
+				if(chosen_views.count(i)==0){ //jλ��i�ӵ�
+					for (auto &key : *share_data->voxels[i]) {
+						if (observed_voxel->find(key.first) == observed_voxel->end()) {
+							score[i]++;
+							//u_rest->setNodeValue(key.first, octomap::logodds(1.0), true);
+							//u_rest->integrateNodeColor(key.first, 255, 0, 0);
+						}
+					}
+					//cout << i <<" : " << score[i] << endl;
+				}
+			//u_rest->updateInnerOccupancy();
+			//u_rest->write(share_data->save_path_nbvnet + "/u_rest.ot");
+			int best_view_id = -1;
+			int best_score = -1;
+			for (int i = 0; i < view_space->views.size(); i++)
+				if (chosen_views.count(i) == 0) { //jλ��i�ӵ�
+					if (score[i] > best_score) {
+						best_score = score[i];
+						best_view_id = i;
+					}
+				}
+			delete observed_voxel;
+			
+
+			//���ϸ������
+			views_voxels_LM* SCOP_solver = new views_voxels_LM(share_data, view_space, &chosen_views);
+			SCOP_solver->solve();
+			vector<int> need_views = SCOP_solver->get_view_id_set();
+			cout<<"GUROBI output is the need_views"<< need_views.size() <<endl;			
+			delete SCOP_solver;
+			
+
+			//�������������
+			octomap::ColorOcTree* octo_model_test = new octomap::ColorOcTree(share_data->octomap_resolution);
+			for (octomap::ColorOcTree::leaf_iterator it = share_data->ground_truth_model->begin_leafs(), end = share_data->ground_truth_model->end_leafs(); it != end; ++it) {
+				octo_model_test->setNodeValue(it.getX(), it.getY(), it.getZ(), octo_model_test->getProbHitLog(), true);
+			}
+			octo_model_test->updateInnerOccupancy();
+			for (double x = share_data->object_center_world(0) - 0.2; x <= share_data->object_center_world(0) + 0.2; x += share_data->octomap_resolution)
+				for (double y = share_data->object_center_world(1) - 0.2; y <= share_data->object_center_world(1) + 0.2; y += share_data->octomap_resolution) {
+					double z = share_data->min_z_table;
+					octo_model_test->setNodeValue(x, y, z, octo_model_test->getProbHitLog(), true);
+				}
+			octo_model_test->updateInnerOccupancy();
+			//octo_model_test->write(share_data->save_path + "/test.ot");
+			int num_of_test = 0;
+			for (octomap::ColorOcTree::leaf_iterator it = octo_model_test->begin_leafs(), end = octo_model_test->end_leafs(); it != end; ++it) {
+				num_of_test++;
+			}
+			//�Լ����������ӽǳ���
+			Perception_3D test(share_data);
+			test.ground_truth_model = octo_model_test;
+			test.full_voxels = num_of_test;
+
+			cout << "did i reach here?1"<<endl;
+
+			//��ʼ��BBXΪ0.5
+			octomap::ColorOcTree* octo_model = new octomap::ColorOcTree(share_data->octomap_resolution);
+			for (int i = 0; i < 32; i++)
+				for (int j = 0; j < 32; j++)
+					for (int k = 0; k < 32; k++)
+					{
+						double x = share_data->object_center_world(0) - share_data->predicted_size + share_data->octomap_resolution * i;
+						double y = share_data->object_center_world(1) - share_data->predicted_size + share_data->octomap_resolution * j;
+						double z = max(share_data->min_z_table, share_data->object_center_world(2) - share_data->predicted_size) + share_data->octomap_resolution * k;
+						//double z = share_data->object_center_world(2) - share_data->predicted_size + share_data->octomap_resolution * k;
+						octo_model->setNodeValue(x, y, z, (float)0, true); //��ʼ������0.5����logoddsΪ0
+					}
+			octo_model->updateInnerOccupancy();
+
+			cout << "did i reach here?2"<<endl;
+
+			//����������
+			for (long long j = share_data->view_cases[cas], i = 0; j != 0; j >>= 1, i++)
+			{
+				cout<<j<<" : "<<i<<endl;
+				if (j&1) { //jλ��i�ӵ�
+					cout<<j<<" : "<<i<<endl;
+					test.precept(&view_space->views[i]);
+					octomap::Pointcloud cloud_octo;
+					for (auto &p : share_data->clouds[view_space->views.size()]->points) {
+						cloud_octo.push_back(p.x, p.y, p.z);
+					}
+					octo_model->insertPointCloud(cloud_octo, octomap::point3d(view_space->views[i].init_pos(0), view_space->views[i].init_pos(1), view_space->views[i].init_pos(2)), -1, true, false);
+					for (auto &p : share_data->clouds[view_space->views.size()]->points) {
+						octo_model->integrateNodeColor(p.x, p.y, p.z, 255, 0, 0);
+						if (p.z < share_data->min_z_table + share_data->octomap_resolution) octo_model->setNodeColor(p.x, p.y, p.z, 0, 0, 255);
+					}
+					octo_model->updateInnerOccupancy();
+					// share_data->clouds[view_space->views.size()]->~PointCloud();
+					share_data->clouds[view_space->views.size()].reset();
+					share_data->clouds.pop_back();
+
+				}
+			}
+			delete octo_model_test;
+			octo_model->updateInnerOccupancy();
+			// octo_model->write(share_data->save_path_nbvnet + "/grid.ot");
+
+			// cout << "did i reach here?3"<<endl;
+
+
+			share_data->access_directory(share_data->save_path);
+			share_data->access_directory(share_data->save_path_nbvnet);
+			ofstream fout_grid(share_data->save_path + "/grid_" + to_string(cas) + ".txt"); //MA-SCVP
+			ofstream fout_grid_nbvnet(share_data->save_path_nbvnet + "/grid_" + to_string(cas) + ".txt");
+			ofstream fout_view_id(share_data->save_path_nbvnet + "/id_" + to_string(cas) + ".txt");
+			ofstream fout_view_ids(share_data->save_path + "/ids_" + to_string(cas) + ".txt"); //MA-SCVP
+			octo_model->write(share_data->save_path_nbvnet + "/grid.ot");			
+			//octomap::ColorOcTree* octo_model_square = new octomap::ColorOcTree(share_data->octomap_resolution);
+			for (int i = 0; i < 32; i++)
+				for (int j = 0; j < 32; j++)
+					for (int k = 0; k < 32; k++)
+					{
+						double x = share_data->object_center_world(0) - share_data->predicted_size + share_data->octomap_resolution * i;
+						double y = share_data->object_center_world(1) - share_data->predicted_size + share_data->octomap_resolution * j;
+						double z = max(share_data->min_z_table, share_data->object_center_world(2) - share_data->predicted_size) + share_data->octomap_resolution * k;
+						//double z = share_data->object_center_world(2) - share_data->predicted_size + share_data->octomap_resolution * k;
+						auto node = octo_model->search(x, y, z);
+						if (node == NULL) cout << "what?" << endl;
+						//fout_grid << x - share_data->object_center_world(0) << ' ' << y - share_data->object_center_world(1) << ' ' << z - share_data->object_center_world(2) << ' ' << node->getOccupancy() << '\n';
+						fout_grid << node->getOccupancy() << '\n';
+						fout_grid_nbvnet << node->getOccupancy() << '\n';
+						//octo_model_square->setNodeValue(x, y, z, node->getLogOdds(), true);
+						//if (node->getOccupancy() > 0.65) {
+						//	if(z >= share_data->min_z_table + share_data->octomap_resolution) octo_model_square->integrateNodeColor(x, y, z, 255, 0, 0);
+						//	else octo_model_square->integrateNodeColor(x, y, z, 0, 0, 255);
+						//}
+					}
+			fout_view_id << best_view_id << '\n';
+			for (int i = 0; i < need_views.size(); i++) { //MA-SCVP
+				fout_view_ids << need_views[i] << '\n';
+			}
+			//octo_model_square->updateInnerOccupancy();
+			//octo_model_square->write(share_data->save_path_nbvnet + "/square_grid.ot");
+			//delete octo_model_square;
+			delete octo_model;
+
+
+			share_data->access_directory(share_data->save_path_pcnbv);
+			ofstream fout_cloud(share_data->save_path_pcnbv + "/cloud_" + to_string(cas) + ".txt");
+			ofstream fout_view_state(share_data->save_path + "/state_" + to_string(cas) + ".txt"); //MA-SCVP
+			ofstream fout_view_state_pcnbv(share_data->save_path_pcnbv + "/state_" + to_string(cas) + ".txt");
+			ofstream fout_view_score(share_data->save_path_pcnbv + "/score_" + to_string(cas) + ".txt");
+
+			pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZRGB>);
+			vector<int> state;
+			state.resize(share_data->num_of_views);
+			for (int i = 0; i < share_data->num_of_views; i++)
+				state[i] = 0;
+			for (int i = 0; i < view_space->views.size(); i++) //��������ѡȡ���ӵ�
+				if (chosen_views.count(i) == 1) { //jλ��i�ӵ�
+					state[i] = 1;
+					*cloud_out += *(share_data->clouds[i]);
+				}
+			//�������������
+			pcl::RandomSample<pcl::PointXYZRGB> ran;
+			ran.setInputCloud(cloud_out);
+			ran.setSample(512); //�����²������Ƶĵ���
+			ran.filter(*cloud_out);
+
+			for (int k = 0; k < cloud_out->points.size(); k++) {
+				fout_cloud << cloud_out->points[k].x << ' ' << cloud_out->points[k].y << ' ' << cloud_out->points[k].z << '\n';
+			}
+			for (int i = 0; i < view_space->views.size(); i++) {
+				fout_view_state << state[i] << '\n';
+				fout_view_state_pcnbv << state[i] << '\n';
+				fout_view_score << 1.0 * score[i] / full_num << '\n';
+			}
+			// cloud_out->~PointCloud();
+			cloud_out.reset();
+			// cout << "did i reach here?4"<<endl;
+
+			cout << "labed " << cas << " getted with executed time " << clock() - now_time << " ms." << endl;
+			/*if (cas == 1) {
+				//test.precept(&view_space->views[best_view_id]);
+				pcl::visualization::PCLVisualizer::Ptr viewer1(new pcl::visualization::PCLVisualizer("Camera"));
+				viewer1->setBackgroundColor(0, 0, 0);
+				viewer1->addCoordinateSystem(0.1);
+				viewer1->initCameraParameters();
+				viewer1->addPointCloud<pcl::PointXYZRGB>(share_data->clouds[best_view_id], "cloud");
+				while (!viewer1->wasStopped())
+				{
+					viewer1->spinOnce(100);
+					boost::this_thread::sleep(boost::posix_time::microseconds(100000));
+				}
+			}*/
+		}
+		return 0;
+	}
+
+	~NBV_Net_Labeler() {
+		delete view_space;
+		delete percept;
+	}
+};
+
+atomic<bool> stop = false;		//���Ƴ������
+Share_Data* share_data;			//����������ָ��
+NBV_Net_Labeler* labeler;
+
+#define DebugOne 0
+#define TestNBV 1
+#define RunMaxLongTail 2
+#define RunSub 3
+#define CheckAll 4
+
+int main()
+{
+	//Init
+	ios::sync_with_stdio(false);
+	int mode;
+	cout << "input mode:";
+	cin >> mode;
+	//���Լ�
+	vector<string> names;
+	cout << "input models:" << endl;
+	string name;
+	while (cin >> name) {
+		if (name == "-1") break;
+		names.push_back(name);
+	}
+	//ѡȡģʽ
+	if (mode == DebugOne){
+		for (int i = 0; i < 1; i++){
+			for (int j = 0; j < 8; j++) {
+				cout<< "im here 111" <<endl;
+				share_data = new Share_Data("../DefaultConfiguration.yaml", "", -1, -1);
+				labeler = new NBV_Net_Labeler(share_data, i, j);
+				if (share_data->init_voxels < 30) continue;
+				labeler->label_all_view_csaes();
+				cout<< "im here" <<endl;
+				// delete labeler;
+				cout<< "im there" <<endl;
+				// delete share_data;
+				cout<< "im where" <<endl;
+			}
+		}
+	}
+	else if (mode == TestNBV){
+		for (int i = 0; i < names.size(); i++) {
+			for (int j = 0; j < 1; j++){
+				for (int k = 0; k < 8; k++) {
+					cout<< "im here 2" <<endl;
+					share_data = new Share_Data("../DefaultConfiguration.yaml", names[i], -1, -1);
+					labeler = new NBV_Net_Labeler(share_data, j, k);
+					if (share_data->init_voxels < 30) continue;
+					labeler->get_nbv_view_cases_and_distrubution();
+					cout<< "im here 3" <<endl;
+					delete labeler;
+					cout<< "im here 4" <<endl;
+					// delete share_data;
+				}
+			}
+		}
+	}
+	else if (mode == RunMaxLongTail) {
+		srand(time(0));
+		cout << "RAND_MAX is " << RAND_MAX << endl;
+		//cout << "input rot:"; int rot; cin >> rot;
+		int need_case_1 = 32;
+		for (int i = 0; i < names.size(); i++) {
+			for (int j = 0; j < 1; j++) {
+				for (int k = 0; k < 1; k++) {
+				//for (int k = rot; k < rot+1; k++) {
+					//LongTailSampleMethod
+					share_data = new Share_Data("../DefaultConfiguration.yaml", names[i], LongTailSampleMethod, need_case_1);
+					// cout <<"didIreachhere?"<<endl;
+					vector<double> distrubution;
+					distrubution.resize(32);
+					for (int m = 0; m < 32; m++) distrubution[m] = 0.0;
+					for (int m = 0; m < 32; m++) {
+						ifstream fin(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/nbv_" + to_string(m) + ".txt");
+						// cout <<"didIreachhere?2"<<m<<endl;
+						if (fin.is_open()) {
+							double surface_added;
+							while (fin >> surface_added) {
+								cout << "!!!!!!!!!!!!!!!!!!!!" << surface_added <<endl;
+								distrubution[m] += surface_added;
+							}
+						}
+						// cout <<"didIreachhere?3"<<endl;
+					}
+					ofstream fout_distrubution(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_distrubution.txt");
+					fout_distrubution << setprecision(10);
+					for (int m = 0; m < 32; m++){
+						distrubution[m] /= 32;
+						fout_distrubution << distrubution[m] << '\n';
+					}
+					fout_distrubution.close();
+					//�����п���NBVcase
+					ifstream fin_view_cases(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/view_cases.txt");
+					vector<vector<long long>> nbv_view_cases_by_iter;
+					vector<vector<long long>> nbv_view_cases_by_view;
+					nbv_view_cases_by_view.resize(32);
+					long long now_case;
+					vector<long long> now_view_cases;
+					// cout <<"didIreachhere?4"<<endl;
+					while (fin_view_cases >> now_case)
+					{
+						// 用内置函数 __builtin_popcountll 计算 popcount
+						// 注意返回值类型是 int，但对于 64位数也够用
+						int pc = __builtin_popcountll(static_cast<unsigned long long>(now_case));
+
+						if (pc == 1)
+						{
+							if (!now_view_cases.empty())
+								nbv_view_cases_by_iter.push_back(now_view_cases);
+							now_view_cases.clear();
+						}
+
+						now_view_cases.push_back(now_case);
+						nbv_view_cases_by_view[pc].push_back(now_case);
+					}
+					// cout <<"didIreachhere?5"<<endl;
+					if (now_view_cases.size() != 0) nbv_view_cases_by_iter.push_back(now_view_cases);
+					//for (int m = 0; m < 32; m++) cout << nbv_view_cases_by_iter[m].size() << endl;
+					//for (int m = 0; m < 32; m++) cout << nbv_view_cases_by_view[m].size() << endl;
+					//���ɳ�β����
+					int sum_case_num = 0;
+					vector<vector<long long>> out_ans_longtail;
+					// cout <<"didIreachhere?6"<<endl;
+					for (long long m = 1; m <= 31; m++) {
+						vector<long long> ans;
+						// cout<<"pointfaultposition?"<<endl;
+						int need_case = ceil(1.0 * need_case_1 / distrubution[1] * distrubution[m]);
+						// cout<<"pointfaultposition?1"<<endl;
+						sum_case_num += need_case;
+						// cout<<"pointfaultposition?2"<<endl;
+						while (ans.size() != need_case) {
+							long long n = ((long long)rand() << 30) + ((long long)rand() << 15) + (long long)rand();
+							// cout<<"pointfaultposition?3"<<endl;
+							// cout << "集合 nbv_view_cases_by_view[" << m << "] 的大小: " << nbv_view_cases_by_view[m].size() << endl;
+							for (size_t i = 0; i < nbv_view_cases_by_view.size(); ++i) {
+                                cout << "nbv_view_cases_by_view[" << i << "] 的大小为: " << nbv_view_cases_by_view[i].size() <<endl;
+                            }
+							n %= (long long)nbv_view_cases_by_view[m].size();
+							
+							// cout<<"pointfaultposition?4"<<endl;
+							ans.push_back(nbv_view_cases_by_view[m][n]);
+							// cout<<"pointfaultposition?5"<<endl;
+							nbv_view_cases_by_view[m].erase(nbv_view_cases_by_view[m].begin() + n);
+							// cout<<"pointfaultposition?6"<<endl;
+						}
+						// cout<<"pointfaultposition?3"<<endl;
+						out_ans_longtail.push_back(ans);
+					}
+					// cout <<"didIreachhere?7"<<endl;
+					share_data->view_cases.clear();
+					ofstream fout_longtail(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_longtail_sample.txt");
+					for (int m = 0; m < out_ans_longtail.size(); m++) {
+						//cout << m + 1 << " size is " << out_ans_longtail[m].size() << endl;
+						for (int n = 0; n < out_ans_longtail[m].size(); n++) {
+							fout_longtail << out_ans_longtail[m][n] << "\n";
+							share_data->view_cases.push_back(out_ans_longtail[m][n]);
+						}
+					}
+					// cout <<"didIreachhere?8"<<endl;
+					fout_longtail.close();
+					labeler = new NBV_Net_Labeler(share_data, j, k);
+					labeler->label_all_view_csaes();
+					delete labeler;
+					// cout <<"didIreachhere?5"<<endl;
+					// delete share_data;
+					// cout <<"didIreachhere?9"<<endl;
+
+					//NBVSampleMethod
+					share_data = new Share_Data("../DefaultConfiguration.yaml", names[i], NBVSampleMethod, need_case_1);
+					//�����һ��caseֱ�����ڵ���sum
+					vector<long long> out_ans_nbv;
+					while (out_ans_nbv.size() < sum_case_num) {
+						long long m = ((long long)rand() << 30) + ((long long)rand() << 15) + (long long)rand();
+						m %= (long long)nbv_view_cases_by_iter.size();
+						//���һ�����һ�³�������������֤ƽ��
+						int need_num = sum_case_num - out_ans_nbv.size();
+						int real_num = out_ans_nbv.size() + nbv_view_cases_by_iter[m].size() - sum_case_num;
+						//cout << need_num << " " << real_num << endl;
+						if (need_num < real_num) break;
+						for(int n=0;n< nbv_view_cases_by_iter[m].size();n++)
+							out_ans_nbv.push_back(nbv_view_cases_by_iter[m][n]);
+						nbv_view_cases_by_iter.erase(nbv_view_cases_by_iter.begin() + m);
+					}
+					share_data->view_cases.clear();
+					ofstream fout_nbv(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_nbv_sample.txt");
+					for (int m = 0; m < out_ans_nbv.size(); m++) {
+						fout_nbv << out_ans_nbv[m] << "\n";
+						share_data->view_cases.push_back(out_ans_nbv[m]);
+					}
+					fout_nbv.close();
+					labeler = new NBV_Net_Labeler(share_data, j, k);
+					labeler->label_all_view_csaes();
+					delete labeler;
+					// cout <<"didIreachhere?10"<<endl;
+					// delete share_data;
+				}
+			}
+		}
+	}
+	else if (mode == RunSub) {
+		srand(time(0));
+		cout << "RAND_MAX is " << RAND_MAX << endl;
+		//cout << "input rot:"; int rot; cin >> rot;
+		//���Ѳ�����������ȡ�Ӽ���sampling_space_case_1ĸ����F1��need_case_1�Ӽ�F1
+		int sampling_space_case_1 = 32; // 32, 16
+		int need_case_1 = 8; //16, 8
+		for (int i = 0; i < names.size(); i++) {
+			for (int j = 0; j < 1; j++) {
+				for (int k = 0; k < 8; k++) {
+					//LongTailSampleMethod
+					share_data = new Share_Data("../DefaultConfiguration.yaml", names[i], LongTailSampleMethod, need_case_1);
+					//��ȡ���ɺõ�NBV�ؽ��ֲ�
+					vector<double> distrubution;
+					distrubution.resize(32);
+					for (int m = 0; m < 32; m++) distrubution[m] = 0.0;
+					for (int m = 0; m < 32; m++) {
+						ifstream fin(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/nbv_" + to_string(m) + ".txt");
+						if (fin.is_open()) {
+							double surface_added;
+							while (fin >> surface_added) {
+								distrubution[m] += surface_added;
+							}
+						}
+					}
+					ofstream fout_distrubution(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_distrubution.txt");
+					fout_distrubution << setprecision(10);
+					for (int m = 0; m < 32; m++) {
+						distrubution[m] /= 32;
+						fout_distrubution << distrubution[m] << '\n';
+					}
+					fout_distrubution.close();
+					//�����п��г�β����case
+					ifstream fin_view_cases(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(sampling_space_case_1) + "_longtail_sample.txt");
+					vector<vector<long long>> nbv_view_cases_by_view;
+					nbv_view_cases_by_view.resize(32);
+					unordered_map<long long, int> map_view_case_with_index;
+					long long now_case;
+					int index_of_view_case = 0;
+					while (fin_view_cases >> now_case) {
+						// 1. 将 now_case 转为 unsigned long long
+						unsigned long long val = static_cast<unsigned long long>(now_case);
+
+						// 2. 使用 GCC/Clang 的内置函数计算 popcount
+						int pc = __builtin_popcountll(val);  // 返回值是 int
+
+						// 3. 原逻辑不变：将 now_case 放入对应下标的容器
+						nbv_view_cases_by_view[pc].push_back(now_case);
+						map_view_case_with_index[now_case] = index_of_view_case++;
+					}
+					fin_view_cases.close();
+					//���ɳ�β����
+					int sum_case_num = 0;
+					vector<vector<long long>> out_ans_longtail;
+					for (long long m = 1; m <= 31; m++) {
+						vector<long long> ans;
+						int need_case = ceil(1.0 * need_case_1 / distrubution[1] * distrubution[m]);
+						sum_case_num += need_case;
+						while (ans.size() != need_case) {
+							long long n = ((long long)rand() << 30) + ((long long)rand() << 15) + (long long)rand();
+							n %= (long long)nbv_view_cases_by_view[m].size();
+							ans.push_back(nbv_view_cases_by_view[m][n]);
+							nbv_view_cases_by_view[m].erase(nbv_view_cases_by_view[m].begin() + n);
+						}
+						out_ans_longtail.push_back(ans);
+					}
+					share_data->view_cases.clear();
+					//���泤β����
+					ofstream fout_longtail(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_longtail_sample.txt");
+					for (int m = 0; m < out_ans_longtail.size(); m++) {
+						//cout << m + 1 << " size is " << out_ans_longtail[m].size() << endl;
+						for (int n = 0; n < out_ans_longtail[m].size(); n++) {
+							fout_longtail << out_ans_longtail[m][n] << "\n";
+							share_data->view_cases.push_back(out_ans_longtail[m][n]);
+						}
+					}
+					fout_longtail.close();
+					labeler = new NBV_Net_Labeler(share_data, j, k);
+					//���ƶ�Ӧ�ļ���Longtail
+					for (int m = 0; m < share_data->view_cases.size(); m++) {
+						int cas = map_view_case_with_index[share_data->view_cases[m]];
+						string path = share_data->pre_path + to_string(sampling_space_case_1) + "/MASCVP_LongTailSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+						string path_nbvnet = share_data->pre_path + to_string(sampling_space_case_1) + "/NBVNET_LongTailSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+						string path_pcnbv = share_data->pre_path + to_string(sampling_space_case_1) + "/PCNBV_LongTailSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+						share_data->access_directory(share_data->save_path);
+						share_data->access_directory(share_data->save_path_nbvnet);
+						share_data->access_directory(share_data->save_path_pcnbv);
+						ofstream fout_grid(share_data->save_path + "/grid_" + to_string(m) + ".txt"); //MA-SCVP
+						ofstream fout_grid_nbvnet(share_data->save_path_nbvnet + "/grid_" + to_string(m) + ".txt");
+						ofstream fout_view_id(share_data->save_path_nbvnet + "/id_" + to_string(m) + ".txt");
+						ofstream fout_view_ids(share_data->save_path + "/ids_" + to_string(m) + ".txt"); //MA-SCVP
+						ofstream fout_cloud(share_data->save_path_pcnbv + "/cloud_" + to_string(m) + ".txt");
+						ofstream fout_view_state(share_data->save_path + "/state_" + to_string(m) + ".txt"); //MA-SCVP
+						ofstream fout_view_state_pcnbv(share_data->save_path_pcnbv + "/state_" + to_string(m) + ".txt");
+						ofstream fout_view_score(share_data->save_path_pcnbv + "/score_" + to_string(m) + ".txt");
+						double temp_double;
+						int temp_int;
+						//Copy MASCVP
+						ifstream fin_grid(path + "grid_" + to_string(cas) + ".txt");
+						while (fin_grid >> temp_double) fout_grid << temp_double << '\n';
+						ifstream fin_state(path + "state_" + to_string(cas) + ".txt");
+						while (fin_state >> temp_int) fout_view_state << temp_int << '\n';
+						ifstream fin_id(path + "ids_" + to_string(cas) + ".txt");
+						while (fin_id >> temp_int) fout_view_ids << temp_int << '\n';
+						//Copy NBVNET
+						ifstream fin_grid_nbvnet(path_nbvnet + "grid_" + to_string(cas) + ".txt");
+						while (fin_grid_nbvnet >> temp_double) fout_grid_nbvnet << temp_double << '\n';
+						ifstream fin_id_nbvnet(path_nbvnet + "id_" + to_string(cas) + ".txt");
+						while (fin_id_nbvnet >> temp_int) fout_view_id << temp_int << '\n';
+						//Copy PCNBV
+						ifstream fin_cloud(path_pcnbv + "cloud_" + to_string(cas) + ".txt");
+						int next_line = 0;
+						while (fin_cloud >> temp_double) {
+							fout_cloud << temp_double << (next_line % 3 == 2 ? '\n' : ' ');
+							next_line++;
+						}
+						ifstream fin_state_pcnbv(path_pcnbv + "state_" + to_string(cas) + ".txt");
+						while (fin_state_pcnbv >> temp_int) fout_view_state_pcnbv << temp_int << '\n';
+						ifstream fin_score(path_pcnbv + "score_" + to_string(cas) + ".txt");
+						while (fin_score >> temp_double) fout_view_score << temp_double << '\n';
+					}
+					delete labeler;
+					// delete share_data;
+
+					//NBVSampleMethod
+					share_data = new Share_Data("../DefaultConfiguration.yaml", names[i], NBVSampleMethod, need_case_1);
+					//�����п���NBVcase
+					fin_view_cases.open(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(sampling_space_case_1) + "_nbv_sample.txt");
+					vector<vector<long long>> nbv_view_cases_by_iter;
+					map_view_case_with_index.clear();
+					index_of_view_case = 0;
+					vector<long long> now_view_cases;
+					while (fin_view_cases >> now_case) {
+						// 将 long long 转为 unsigned long long
+						unsigned long long val = static_cast<unsigned long long>(now_case);
+						// 计算 popcount，返回值是 int
+						int pc = __builtin_popcountll(val);
+
+						if (pc == 1) {
+							if (!now_view_cases.empty()) {
+								nbv_view_cases_by_iter.push_back(now_view_cases);
+							}
+							now_view_cases.clear();
+						}
+						now_view_cases.push_back(now_case);
+						map_view_case_with_index[now_case] = index_of_view_case++;
+					}
+					if (now_view_cases.size() != 0) nbv_view_cases_by_iter.push_back(now_view_cases);
+					fin_view_cases.close();
+					//�����һ��caseֱ�����ڵ���sum
+					vector<long long> out_ans_nbv;
+					while (out_ans_nbv.size() < sum_case_num) {
+						long long m = ((long long)rand() << 30) + ((long long)rand() << 15) + (long long)rand();
+						m %= (long long)nbv_view_cases_by_iter.size();
+						//���һ�����һ�³�������������֤ƽ��
+						int need_num = sum_case_num - out_ans_nbv.size();
+						int real_num = out_ans_nbv.size() + nbv_view_cases_by_iter[m].size() - sum_case_num;
+						//cout << need_num << " " << real_num << endl;
+						if (need_num < real_num) break;
+						for (int n = 0; n < nbv_view_cases_by_iter[m].size(); n++)
+							out_ans_nbv.push_back(nbv_view_cases_by_iter[m][n]);
+						nbv_view_cases_by_iter.erase(nbv_view_cases_by_iter.begin() + m);
+					}
+					share_data->view_cases.clear();
+					//����NBV����
+					ofstream fout_nbv(share_data->gt_path + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_nbv_sample.txt");
+					for (int m = 0; m < out_ans_nbv.size(); m++) {
+						fout_nbv << out_ans_nbv[m] << "\n";
+						share_data->view_cases.push_back(out_ans_nbv[m]);
+					}
+					fout_nbv.close();
+					labeler = new NBV_Net_Labeler(share_data, j, k);
+					//���ƶ�Ӧ�ļ���nbv
+					for (int m = 0; m < share_data->view_cases.size(); m++) {
+						int cas = map_view_case_with_index[share_data->view_cases[m]];
+						string path = share_data->pre_path + to_string(sampling_space_case_1) + "/MASCVP_NBVSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+						string path_nbvnet = share_data->pre_path + to_string(sampling_space_case_1) + "/NBVNET_NBVSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+						string path_pcnbv = share_data->pre_path + to_string(sampling_space_case_1) + "/PCNBV_NBVSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+						share_data->access_directory(share_data->save_path);
+						share_data->access_directory(share_data->save_path_nbvnet);
+						share_data->access_directory(share_data->save_path_pcnbv);
+						ofstream fout_grid(share_data->save_path + "/grid_" + to_string(m) + ".txt"); //MA-SCVP
+						ofstream fout_grid_nbvnet(share_data->save_path_nbvnet + "/grid_" + to_string(m) + ".txt");
+						ofstream fout_view_id(share_data->save_path_nbvnet + "/id_" + to_string(m) + ".txt");
+						ofstream fout_view_ids(share_data->save_path + "/ids_" + to_string(m) + ".txt"); //MA-SCVP
+						ofstream fout_cloud(share_data->save_path_pcnbv + "/cloud_" + to_string(m) + ".txt");
+						ofstream fout_view_state(share_data->save_path + "/state_" + to_string(m) + ".txt"); //MA-SCVP
+						ofstream fout_view_state_pcnbv(share_data->save_path_pcnbv + "/state_" + to_string(m) + ".txt");
+						ofstream fout_view_score(share_data->save_path_pcnbv + "/score_" + to_string(m) + ".txt");
+						double temp_double;
+						int temp_int;
+						//Copy MASCVP
+						ifstream fin_grid(path + "grid_" + to_string(cas) + ".txt");
+						while (fin_grid >> temp_double) fout_grid << temp_double << '\n';
+						ifstream fin_state(path + "state_" + to_string(cas) + ".txt");
+						while (fin_state >> temp_int) fout_view_state << temp_int << '\n';
+						ifstream fin_id(path + "ids_" + to_string(cas) + ".txt");
+						while (fin_id >> temp_int) fout_view_ids << temp_int << '\n';
+						//Copy NBVNET
+						ifstream fin_grid_nbvnet(path_nbvnet + "grid_" + to_string(cas) + ".txt");
+						while (fin_grid_nbvnet >> temp_double) fout_grid_nbvnet << temp_double << '\n';
+						ifstream fin_id_nbvnet(path_nbvnet + "id_" + to_string(cas) + ".txt");
+						while (fin_id_nbvnet >> temp_int) fout_view_id << temp_int << '\n';
+						//Copy PCNBV
+						ifstream fin_cloud(path_pcnbv + "cloud_" + to_string(cas) + ".txt");
+						int next_line = 0;
+						while (fin_cloud >> temp_double) {
+							fout_cloud << temp_double << (next_line % 3 == 2 ? '\n' : ' ');
+							next_line++;
+						}
+						ifstream fin_state_pcnbv(path_pcnbv + "state_" + to_string(cas) + ".txt");
+						while (fin_state_pcnbv >> temp_int) fout_view_state_pcnbv << temp_int << '\n';
+						ifstream fin_score(path_pcnbv + "score_" + to_string(cas) + ".txt");
+						while (fin_score >> temp_double) fout_view_score << temp_double << '\n';
+					}
+					delete labeler;
+					// delete share_data;
+				}
+			}
+		}
+	}
+	else if (mode == CheckAll) {
+		share_data = new Share_Data("../DefaultConfiguration.yaml", "", -1, -1);
+		for (int need_case_1 = 32; need_case_1 >= 8; need_case_1 -= 8) if (need_case_1 != 24 && need_case_1 != 16) {
+			for (int i = 0; i < names.size(); i++) {
+				for (int k = 0; k < 8; k++) {
+					cout << "checking need_case_1 " << need_case_1 << " , object " << names[i] << " , rotate " << k << " :" << endl;
+					cout << "checking LongTailSample:" << endl;
+					string path = share_data->pre_path + to_string(need_case_1) + "/MASCVP_LongTailSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+					string path_nbvnet = share_data->pre_path + to_string(need_case_1) + "/NBVNET_LongTailSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+					string path_pcnbv = share_data->pre_path + to_string(need_case_1) + "/PCNBV_LongTailSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+					int cas_num = 0;
+					long long case_temp;
+					ifstream fin_case_num(share_data->pre_path + "NBV_GT_label/" + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_longtail_sample.txt");
+					while (fin_case_num >> case_temp) cas_num++;
+					fin_case_num.close();
+					cout << "case num is "<< cas_num << endl;
+					if (cas_num == 0) cout << "case missing wrong! " << endl;
+					for (int j = 0; j < cas_num; j++) {
+						double temp;
+						int num_gird, num_id, num_cloud, num_state, num_score;
+						//Check MASCVP
+						ifstream fin_grid(path + "grid_" + to_string(j) + ".txt");
+						num_gird = 0;
+						while (fin_grid >> temp) num_gird++;
+						num_state = 0;
+						ifstream fin_state(path + "state_" + to_string(j) + ".txt");
+						while (fin_state >> temp) num_state++;
+						num_id = 0;
+						ifstream fin_id(path + "ids_" + to_string(j) + ".txt");
+						while (fin_id >> temp) num_id++;
+						//cout << num_gird << " " << num_id << endl;
+						if (num_gird != 32 * 32 * 32 || num_state != 32 || num_id == 0) {
+							cout << "MASCVP Object case " << j << " wrong." << endl;
+						}
+						//Check NBVNET
+						ifstream fin_grid_nbvnet(path_nbvnet + "grid_" + to_string(j) + ".txt");
+						num_gird = 0;
+						while (fin_grid_nbvnet >> temp) num_gird++;
+						num_id = 0;
+						ifstream fin_id_nbvnet(path_nbvnet + "id_" + to_string(j) + ".txt");
+						while (fin_id_nbvnet >> temp) num_id++;
+						//cout << num_gird << " " << num_id << endl;
+						if (num_gird != 32 * 32 * 32 || num_id != 1) {
+							cout << "NBVNET Object case " << j << " wrong." << endl;
+						}
+						//Check PCNBV
+						num_cloud = 0;
+						ifstream fin_cloud(path_pcnbv + "cloud_" + to_string(j) + ".txt");
+						while (fin_cloud >> temp) num_cloud++;
+						num_state = 0;
+						ifstream fin_state_pcnbv(path_pcnbv + "state_" + to_string(j) + ".txt");
+						while (fin_state_pcnbv >> temp) num_state++;
+						num_score = 0;
+						ifstream fin_score(path_pcnbv + "score_" + to_string(j) + ".txt");
+						while (fin_score >> temp) num_score++;
+						//cout << num_state << " " << num_score << endl;
+						if (num_state != 32 || num_score != 32 || num_cloud != 512 * 3) {
+							cout << "PCNBV Object case " << j << " wrong." << endl;
+						}
+					}
+					cout << "checking NBVSample:" << endl;
+					path = share_data->pre_path + to_string(need_case_1) + "/MASCVP_NBVSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+					path_nbvnet = share_data->pre_path + to_string(need_case_1) + "/NBVNET_NBVSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+					path_pcnbv = share_data->pre_path + to_string(need_case_1) + "/PCNBV_NBVSample/" + names[i] + "/rotate_" + to_string(k) + "/";
+					cas_num = 0;
+					fin_case_num.open(share_data->pre_path + "NBV_GT_label/" + names[i] + "/rotate_" + to_string(k) + "/" + to_string(need_case_1) + "_nbv_sample.txt");
+					while (fin_case_num >> case_temp) cas_num++;
+					fin_case_num.close();
+					cout << "case num is " << cas_num << endl;
+					if (cas_num == 0) cout << "case missing wrong! " << endl;
+					for (int j = 0; j < cas_num; j++) {
+						double temp;
+						int num_gird, num_id, num_cloud, num_state, num_score;
+						//Check MASCVP
+						ifstream fin_grid(path + "grid_" + to_string(j) + ".txt");
+						num_gird = 0;
+						while (fin_grid >> temp) num_gird++;
+						num_state = 0;
+						ifstream fin_state(path + "state_" + to_string(j) + ".txt");
+						while (fin_state >> temp) num_state++;
+						num_id = 0;
+						ifstream fin_id(path + "ids_" + to_string(j) + ".txt");
+						while (fin_id >> temp) num_id++;
+						//cout << num_gird << " " << num_id << endl;
+						if (num_gird != 32 * 32 * 32 || num_state != 32 || num_id == 0) {
+							cout << "MASCVP Object case " << j << " wrong." << endl;
+						}
+						//Check NBVNET
+						ifstream fin_grid_nbvnet(path_nbvnet + "grid_" + to_string(j) + ".txt");
+						num_gird = 0;
+						while (fin_grid_nbvnet >> temp) num_gird++;
+						num_id = 0;
+						ifstream fin_id_nbvnet(path_nbvnet + "id_" + to_string(j) + ".txt");
+						while (fin_id_nbvnet >> temp) num_id++;
+						//cout << num_gird << " " << num_id << endl;
+						if (num_gird != 32 * 32 * 32 || num_id != 1) {
+							cout << "NBVNET Object case " << j << " wrong." << endl;
+						}
+						//Check PCNBV
+						num_cloud = 0;
+						ifstream fin_cloud(path_pcnbv + "cloud_" + to_string(j) + ".txt");
+						while (fin_cloud >> temp) num_cloud++;
+						num_state = 0;
+						ifstream fin_state_pcnbv(path_pcnbv + "state_" + to_string(j) + ".txt");
+						while (fin_state_pcnbv >> temp) num_state++;
+						num_score = 0;
+						ifstream fin_score(path_pcnbv + "score_" + to_string(j) + ".txt");
+						while (fin_score >> temp) num_score++;
+						//cout << num_state << " " << num_score << endl;
+						if (num_state != 32 || num_score != 32 || num_cloud != 512 * 3) {
+							cout << "PCNBV Object case " << j << " wrong." << endl;
+						}
+					}
+				}
+			}
+		}
+	}
+	cout << "System over." << endl;
+	return 0;
+}
+
+/*
+Armadillo
+Asian_Dragon
+Dragon
+Stanford_Bunny
+Happy_Buddha
+Thai_Statue
+Lucy
+LM1
+LM2
+LM3
+LM4
+LM5
+LM6
+LM7
+LM8
+LM9
+LM10
+LM11
+LM12
+obj_000001
+obj_000002
+obj_000003
+obj_000004
+obj_000005
+obj_000006
+obj_000007
+obj_000008
+obj_000009
+obj_000010
+obj_000011
+obj_000012
+obj_000013
+obj_000014
+obj_000015
+obj_000016
+obj_000017
+obj_000018
+obj_000019
+obj_000020
+obj_000021
+obj_000022
+obj_000023
+obj_000024
+obj_000025
+obj_000026
+obj_000027
+obj_000028
+obj_000029
+obj_000030
+obj_000031
+*/
